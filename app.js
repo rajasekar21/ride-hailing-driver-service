@@ -1,10 +1,30 @@
 const express = require("express");
 const cors = require("cors");
 const { Sequelize, DataTypes } = require("sequelize");
+const promClient = require("prom-client");
+const logger = require("./shared/logger");
+const correlationMiddleware = require("./shared/correlationMiddleware");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(correlationMiddleware);
+
+// Prometheus metrics
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+const driversTotal = new promClient.Gauge({
+  name: 'driver_drivers_total',
+  help: 'Total number of drivers',
+  registers: [register]
+});
+
+const activeDriversTotal = new promClient.Gauge({
+  name: 'driver_active_drivers_total',
+  help: 'Total number of active drivers',
+  registers: [register]
+});
 
 const db = new Sequelize({
   dialect: "sqlite",
@@ -20,19 +40,33 @@ const Driver = db.define("Driver", {
   vehicle_plate: DataTypes.STRING,
   is_active: DataTypes.BOOLEAN,
   city: DataTypes.STRING,
+  password: DataTypes.STRING,
+  role: { type: DataTypes.STRING, defaultValue: 'driver' },
   created_at: DataTypes.STRING
 });
 
 db.sync();
 
 app.use((req, res, next) => {
-  const requestId = req.get("X-Request-ID") || `req-${Date.now()}`;
-  req.requestId = requestId;
-  console.log(JSON.stringify({ requestId, method: req.method, path: req.path, query: req.query, body: req.body }));
+  const startMs = Date.now();
+  req.requestId = req.correlationId;
+  req.traceId = req.correlationId;
+  logger.info({ correlationId: req.correlationId, method: req.method, path: req.path }, "request started");
+  res.on("finish", () => {
+    logger.info({
+      correlationId: req.correlationId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startMs
+    }, "request completed");
+  });
   next();
 });
 
-app.get("/v1/drivers", async (req, res) => {
+const v1Router = express.Router();
+
+v1Router.get("/drivers", async (req, res) => {
   const where = {};
   if (req.query.active === "true") {
     where.is_active = true;
@@ -41,7 +75,7 @@ app.get("/v1/drivers", async (req, res) => {
   res.send(drivers);
 });
 
-app.get("/v1/drivers/:id", async (req, res) => {
+v1Router.get("/drivers/:id", async (req, res) => {
   const driver = await Driver.findByPk(req.params.id);
   if (!driver) {
     return res.status(404).send({ error: "Driver not found" });
@@ -49,17 +83,23 @@ app.get("/v1/drivers/:id", async (req, res) => {
   res.send(driver);
 });
 
-app.post("/v1/drivers", async (req, res) => {
+v1Router.post("/drivers", async (req, res) => {
   try {
+    const { id, name, phone, email, vehicle_type, vehicle_plate, is_active, city, password, role } = req.body;
+    if (!id || !name || !email || !password) {
+      return res.status(400).send({ error: "id, name, email, and password are required" });
+    }
     const driver = await Driver.create({
-      id: req.body.id,
-      name: req.body.name,
-      phone: req.body.phone,
-      email: req.body.email,
-      vehicle_type: req.body.vehicle_type,
-      vehicle_plate: req.body.vehicle_plate,
-      is_active: req.body.is_active === true,
-      city: req.body.city,
+      id,
+      name,
+      phone,
+      email,
+      vehicle_type,
+      vehicle_plate,
+      is_active: is_active === true,
+      city,
+      password,
+      role: role || 'driver',
       created_at: new Date().toISOString()
     });
     res.status(201).send(driver);
@@ -68,7 +108,7 @@ app.post("/v1/drivers", async (req, res) => {
   }
 });
 
-app.patch("/v1/drivers/:id/status", async (req, res) => {
+v1Router.patch("/drivers/:id/status", async (req, res) => {
   const driver = await Driver.findByPk(req.params.id);
   if (!driver) {
     return res.status(404).send({ error: "Driver not found" });
@@ -81,8 +121,21 @@ app.patch("/v1/drivers/:id/status", async (req, res) => {
   res.send(driver);
 });
 
+app.use("/v1", v1Router);
+
 app.get("/health", (req, res) => res.send("OK"));
 
-app.listen(3000, () => {
-  console.log("Driver service running on port 3000");
+app.get("/metrics", async (req, res) => {
+  const driverCount = await Driver.count();
+  const activeDriverCount = await Driver.count({ where: { is_active: true } });
+  driversTotal.set(driverCount);
+  activeDriversTotal.set(activeDriverCount);
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  logger.info({ service: "driver", port: PORT }, "service started");
 });
